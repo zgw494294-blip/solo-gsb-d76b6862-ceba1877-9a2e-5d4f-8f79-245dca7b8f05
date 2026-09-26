@@ -1,0 +1,8 @@
+services:
+  journey:
+    build: .
+    image: journey-planner:latest
+    container_name: journey-planner
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
