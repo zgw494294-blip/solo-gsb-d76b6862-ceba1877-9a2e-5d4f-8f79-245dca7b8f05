@@ -10,6 +10,7 @@ from .disruption import min_disruption
 from .fares import quote_fares
 from .fleet import assign_fleet
 from .hold import plan_hold
+from .inspect import plan_inspect
 from .meet import plan_meet
 from .models import (
     DesignRequest,
@@ -22,6 +23,8 @@ from .models import (
     FleetAssignResponse,
     FleetChargeRequest,
     FleetChargeResponse,
+    FleetInspectRequest,
+    FleetInspectResponse,
     GtfsRequest,
     GtfsResponse,
     HoldRequest,
@@ -48,6 +51,7 @@ app = FastAPI(
         "conversion, two-traveller meeting planning, minimum-fare ticket "
         "quoting, minimum-fleet vehicle assignment, minimum-cost "
         "charging of one electric vehicle along a fixed trip chain, "
+        "mileage-based inspection planning along a fixed trip chain, "
         "group-booking seat "
         "allocation, minimum-cancellation "
         "network disruption analysis, on-time reliability scoring of "
@@ -71,6 +75,7 @@ def root() -> dict:
             "POST /v1/fares/quote",
             "POST /v1/fleet/assign",
             "POST /v1/fleet/charge",
+            "POST /v1/fleet/inspect",
             "POST /v1/seats/allocate",
             "POST /v1/network/disruption",
             "POST /v1/gtfs",
@@ -161,6 +166,19 @@ def fleet_charge(request: FleetChargeRequest) -> FleetChargeResponse:
         chargers=request.chargers,
     )
     return FleetChargeResponse(**result)
+
+
+@app.post("/v1/fleet/inspect", response_model=FleetInspectResponse)
+def fleet_inspect(request: FleetInspectRequest) -> FleetInspectResponse:
+    result = plan_inspect(
+        trips=request.trips,
+        trip_ids=request.trip_ids,
+        trip_km=request.trip_km,
+        limit_km=request.limit_km,
+        initial_km=request.initial_km,
+        workshops=request.workshops,
+    )
+    return FleetInspectResponse(**result)
 
 
 @app.post("/v1/seats/allocate", response_model=SeatAllocateResponse)

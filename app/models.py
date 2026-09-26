@@ -434,6 +434,139 @@ class FleetChargeResponse(BaseModel):
     charges: list[int] = Field(default_factory=list)
 
 
+class Workshop(BaseModel):
+    """One station where the vehicle may be inspected between two trips."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    station: str = Field(min_length=1)
+    open: int = Field(
+        ge=0, le=MAX_MINUTE, description="first open minute of the workshop"
+    )
+    close: int = Field(
+        ge=0,
+        le=MAX_MINUTE,
+        description="the workshop closes at this minute (exclusive)",
+    )
+    minutes: int = Field(
+        ge=1, le=120, description="duration of one inspection in minutes"
+    )
+    price_cents: int = Field(
+        ge=0, description="non-negative price of one inspection"
+    )
+
+    @model_validator(mode="after")
+    def open_before_close(self) -> "Workshop":
+        if self.open >= self.close:
+            raise ValueError(
+                f"open ({self.open}) must be earlier than close "
+                f"({self.close})"
+            )
+        return self
+
+
+class FleetInspectRequest(TripNetwork):
+    """Minimum-inspection maintenance plan for one vehicle's fixed trip chain.
+
+    ``trip_ids`` is the chain in execution order; ``trip_km`` maps every
+    chained trip to the kilometres it adds to the accumulated mileage.
+    After every trip the accumulated mileage must stay within
+    ``limit_km``; an inspection — only possible during the stop between
+    two consecutive trips, at a station with a workshop whose open
+    interval fits the whole work duration — resets it to zero.
+    """
+
+    trip_ids: list[str] = Field(min_length=1, max_length=40)
+    trip_km: dict[str, Annotated[int, Field(ge=1, le=300)]] = Field(
+        description=(
+            "per-trip mileage; keys must be exactly the chained trip ids"
+        )
+    )
+    limit_km: int = Field(ge=1, le=300)
+    initial_km: int = Field(ge=0)
+    workshops: list[Workshop] = Field(max_length=40)
+
+    @field_validator("trip_ids")
+    @classmethod
+    def trip_ids_distinct(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("trip_ids must be distinct")
+        return value
+
+    @model_validator(mode="after")
+    def chain_and_workshops_valid(self) -> "FleetInspectRequest":
+        trips = self.trip_index
+        for i, trip_id in enumerate(self.trip_ids):
+            if trip_id not in trips:
+                raise ValueError(
+                    f"trip_ids {i}: trip_id {trip_id!r} does not exist"
+                )
+        chained = set(self.trip_ids)
+        missing = [t for t in self.trip_ids if t not in self.trip_km]
+        if missing:
+            raise ValueError(f"trip_km is missing trip ids: {missing}")
+        unknown = [key for key in self.trip_km if key not in chained]
+        if unknown:
+            raise ValueError(
+                f"trip_km references trip ids outside the chain: {unknown}"
+            )
+        if self.initial_km > self.limit_km:
+            raise ValueError(
+                f"initial_km ({self.initial_km}) must not exceed "
+                f"limit_km ({self.limit_km})"
+            )
+        known = set(self.stations)
+        seen: set[str] = set()
+        for workshop in self.workshops:
+            if workshop.station in seen:
+                raise ValueError(
+                    f"workshop station {workshop.station!r} is duplicated"
+                )
+            seen.add(workshop.station)
+            if workshop.station not in known:
+                raise ValueError(
+                    f"workshop station {workshop.station!r} is not one of "
+                    "the stations"
+                )
+        for i in range(len(self.trip_ids) - 1):
+            prev = trips[self.trip_ids[i]]
+            curr = trips[self.trip_ids[i + 1]]
+            end = prev.stops[-1]
+            start = curr.stops[0]
+            if end.station != start.station:
+                raise ValueError(
+                    f"trip_ids {i + 1}: trip {curr.id!r} starts at "
+                    f"{start.station!r}, but the previous trip {prev.id!r} "
+                    f"ends at {end.station!r}"
+                )
+            if start.departure < end.arrival:
+                raise ValueError(
+                    f"trip_ids {i + 1}: trip {curr.id!r} departs at minute "
+                    f"{start.departure}, before the previous trip "
+                    f"{prev.id!r} arrives at {end.arrival}"
+                )
+        return self
+
+
+class InspectionEntry(BaseModel):
+    """One scheduled inspection at the stop between two chained trips."""
+
+    index: int = Field(
+        ge=0,
+        description=(
+            "0-based connection index: the inspection happens between "
+            "trip_ids[index] and trip_ids[index + 1]"
+        ),
+    )
+    station: str
+
+
+class FleetInspectResponse(BaseModel):
+    feasible: bool
+    inspections: list[InspectionEntry] = Field(default_factory=list)
+    total_cents: Optional[int] = None
+
+
 class Booking(BaseModel):
     """One group booking: a fixed ride chain for a party of passengers."""
 

@@ -1,6 +1,6 @@
 # 固定班次换乘规划 API（离线）
 
-基于 **Python 3.11 + FastAPI** 的离线服务，提供十一个接口：
+基于 **Python 3.11 + FastAPI** 的离线服务，提供十二个接口：
 
 - `POST /v1/journey`：在给定站点集合与固定班次表中，计算从起点到终点的**最早到达**行程；
   到达时间相同时优先**换乘更少**，再按**班次 ID 序列字典序**取最小。
@@ -16,6 +16,9 @@
 - `POST /v1/fleet/charge`：为一辆电动车的既定班次链安排**最低电费补电方案**：仅在两班间
   停站且已配置充电站的站按整单位充电，每班出发前电量须覆盖本班耗电；电费并列时取
   充电量列表字典序最小者。
+- `POST /v1/fleet/inspect`：为既定班次链规划**里程检修**：每班结束后累计里程不得超过上限，
+  仅可在两班之间、车间开放时段与停站时长的交集内完成检修并归零里程；先使**检修次数**
+  最少，再使**总费用**最低，并列时取**接续索引序列字典序**最小者。
 - `POST /v1/seats/allocate`：在每班座位容量约束下**分配团体预订**，使接纳乘客数最大；
   并列时取接纳 ID 升序列表字典序最小者。
 - `POST /v1/network/disruption`：求使出行需求**失去按时可达性**的**最少停运班次**；
@@ -40,7 +43,7 @@ docker compose up --build
 
 服务监听 **8000 端口**：
 
-- 接口：`POST http://localhost:8000/v1/journey`、`POST http://localhost:8000/v1/journey/meet`、`POST http://localhost:8000/v1/journey/reliability`、`POST http://localhost:8000/v1/fares/quote`、`POST http://localhost:8000/v1/fleet/assign`、`POST http://localhost:8000/v1/fleet/charge`、`POST http://localhost:8000/v1/seats/allocate`、`POST http://localhost:8000/v1/network/disruption`、`POST http://localhost:8000/v1/gtfs`、`POST http://localhost:8000/v1/timetable/design`、`POST http://localhost:8000/v1/transfers/hold`
+- 接口：`POST http://localhost:8000/v1/journey`、`POST http://localhost:8000/v1/journey/meet`、`POST http://localhost:8000/v1/journey/reliability`、`POST http://localhost:8000/v1/fares/quote`、`POST http://localhost:8000/v1/fleet/assign`、`POST http://localhost:8000/v1/fleet/charge`、`POST http://localhost:8000/v1/fleet/inspect`、`POST http://localhost:8000/v1/seats/allocate`、`POST http://localhost:8000/v1/network/disruption`、`POST http://localhost:8000/v1/gtfs`、`POST http://localhost:8000/v1/timetable/design`、`POST http://localhost:8000/v1/transfers/hold`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
 停止：`docker compose down`。
@@ -632,6 +635,115 @@ T1 后电量剩 5，T2 需 20，故在 B 至少充 15（5 分/单位）；T3 需
   `price_cents` 为负；
 - 字段缺失、出现多余字段或类型错误等。
 
+## 里程检修：`POST /v1/fleet/inspect`
+
+`stations`、`trips` 的格式与约束与 `/v1/journey` 完全相同；请求另给一条**既定班次链**
+（`trip_ids`，按执行顺序排列）、每班里程 `trip_km`、里程上限与初始里程，以及车间列表
+`workshops`，求完成全链的**检修计划**。
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `trip_ids` | `string[]` | 1～40 个，按执行顺序排列且**互不相同**，每个都必须存在于 `trips` |
+| `trip_km` | `object` | 键必须**恰好**覆盖链上班次 ID（缺班或多出链外班次均 422），值为 1～300 的每班里程 |
+| `limit_km` | `int` | 1～300，累计里程上限 |
+| `initial_km` | `int` | 0～`limit_km`，出发时的初始累计里程 |
+| `workshops` | `object[]` | 0～40 个车间，`station` **互不相同**且必须出现在 `stations` 中 |
+| `workshops[].open` / `close` | `int` | 0～2879，开放区间 `[open, close)`，必须 `open < close` |
+| `workshops[].minutes` | `int` | 1～120，一次检修的工时（分钟） |
+| `workshops[].price_cents` | `int` | 非负整数，一次检修的费用（分） |
+
+### 接续与检修规则
+
+- 班次链按 `trip_ids` 顺序执行：相邻两班必须在**同一站**接续（前班末站 = 后班首站），
+  且后班首站发车**不得早于**前班末站到达（边界相等视为合法）；接续违规返回 422；
+- 车辆从 `initial_km` 起累计里程，每班结束后加上该班 `trip_km`；**每班结束后**累计里程
+  不得超过 `limit_km`（边界相等视为合法）；
+- **仅在两班之间的停站**可以检修（首班之前、末班之后以及班次途中均不检修），且该站
+  必须已配置车间；检修工时须**完整落在**「前班末站到达至后班首站发车」与车间开放区间
+  `[open, close)` 的交集内（即 `min(后班发车, close) − max(前班到达, open) ≥ minutes`，
+  边界相等视为合法）；
+- 检修后累计里程**归零**；每次检修费用为该车间 `price_cents`，总费用为各次之和；
+- 优选顺序：① **检修次数最少**；② 并列时**总费用最低**；③ 仍相同取**接续索引序列**
+  （从 0 起、按接续顺序升序）**字典序最小**的方案。
+
+### 调用示例
+
+```bash
+curl -s -X POST http://localhost:8000/v1/fleet/inspect \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "stations": ["A", "B", "C", "D"],
+    "trips": [
+      {"id": "T1", "stops": [
+        {"station": "A", "arrival": 0,   "departure": 60},
+        {"station": "B", "arrival": 120, "departure": 120}
+      ]},
+      {"id": "T2", "stops": [
+        {"station": "B", "arrival": 150, "departure": 150},
+        {"station": "C", "arrival": 220, "departure": 220}
+      ]},
+      {"id": "T3", "stops": [
+        {"station": "C", "arrival": 230, "departure": 230},
+        {"station": "D", "arrival": 300, "departure": 300}
+      ]}
+    ],
+    "trip_ids": ["T1", "T2", "T3"],
+    "trip_km": {"T1": 120, "T2": 100, "T3": 80},
+    "limit_km": 200,
+    "initial_km": 50,
+    "workshops": [
+      {"station": "B", "open": 100, "close": 200,  "minutes": 30, "price_cents": 800},
+      {"station": "C", "open": 0,   "close": 2879, "minutes": 10, "price_cents": 300}
+    ]
+  }'
+```
+
+T1 结束后里程为 50 + 120 = 170；不检修则 T2 结束后达 270 超限，故必须在 B 检修
+（停站 [120, 150] 与开放 [100, 200) 的交集恰为 30 分钟，工时 30 分钟刚好完整落入），
+里程归零并花费 800 分；T2 结束后里程 100，T3 结束后 180 不超限，无需在 C 检修，
+故返回（`200 OK`）：
+
+```json
+{
+  "feasible": true,
+  "inspections": [
+    {"index": 0, "station": "B"}
+  ],
+  "total_cents": 800
+}
+```
+
+### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `feasible` | 是否存在完成全链的检修方案 |
+| `inspections` | 依次检修的接续列表，按接续顺序排列（不可行时为 `[]`） |
+| `inspections[].index` | 接续索引（**从 0 开始**）：检修发生在 `trip_ids[index]` 与 `trip_ids[index + 1]` 之间的停站 |
+| `inspections[].station` | 检修所在（即该接续的）车站 |
+| `total_cents` | 最低总检修费用（分）（不可行时为 `null`） |
+
+### 无法完成
+
+任何检修安排都无法完成全链时（如首班里程已超限、某班自身里程超过上限、需要检修的
+接续站没有车间、停站与开放时段的交集容不下工时等）返回 `200` 与空方案：
+
+```json
+{"feasible": false, "inspections": [], "total_cents": null}
+```
+
+### 检修接口的 422 情形
+
+除 `stations` / `trips` 本身的校验外（与 `/v1/journey` 一致），以下情况也返回 `422`：
+
+- `trip_ids` 数量不在 1～40、班次 ID 重复或引用不存在的班次；
+- 相邻两班不在同一站接续，或后班首站发车早于前班末站到达；
+- `trip_km` 未恰好覆盖链上班次（缺班、多出链外班次），或里程超出 1～300；
+- `limit_km` 超出 1～300、`initial_km` 为负或超过 `limit_km`；
+- `workshops` 超过 40 个、`station` 重复或不在 `stations` 中、`open` / `close` 超出
+  0～2879 或 `open ≥ close`、`minutes` 超出 1～120、`price_cents` 为负；
+- 字段缺失、出现多余字段或类型错误等。
+
 ## 团体订座：`POST /v1/seats/allocate`
 
 `stations`、`trips` 的格式与约束与 `/v1/journey` 完全相同；请求另含每班座位容量
@@ -1199,7 +1311,7 @@ pytest
 
 ```
 app/
-  main.py      # FastAPI 应用与路由（/v1/journey、/v1/journey/meet、/v1/journey/reliability、/v1/fares/quote、/v1/fleet/assign、/v1/fleet/charge、/v1/seats/allocate、/v1/network/disruption、/v1/gtfs、/v1/timetable/design、/v1/transfers/hold）
+  main.py      # FastAPI 应用与路由（/v1/journey、/v1/journey/meet、/v1/journey/reliability、/v1/fares/quote、/v1/fleet/assign、/v1/fleet/charge、/v1/fleet/inspect、/v1/seats/allocate、/v1/network/disruption、/v1/gtfs、/v1/timetable/design、/v1/transfers/hold）
   models.py    # 请求/响应模型与全部输入校验（违规即 422）
   planner.py   # 纯标准库的最早到达规划器（带换乘缓冲与字典序决胜）
   meet.py      # 纯标准库的两人会合规划器（全到达时刻标签 + 等待窗口配对）
@@ -1207,6 +1319,7 @@ app/
   fares.py     # 纯标准库的最低票价分段动态规划（票数与票券 ID 序列决胜）
   fleet.py     # 纯标准库的最少车辆分配（DAG 最小路径覆盖 + 二分图匹配）
   charge.py    # 纯标准库的电动车补电规划（按电量级别的动态规划 + 字典序决胜）
+  inspect.py   # 纯标准库的里程检修规划（按累计里程级别的动态规划 + 字典序决胜）
   seats.py     # 纯标准库的团体订座分配（分支限界 + 字典序决胜）
   disruption.py# 纯标准库的最少停运分析（命中集递归 + 字典序决胜）
   gtfs.py      # 纯标准库的 GTFS 子集 → 当日网络转换器（日历/例外/频率展开）
@@ -1219,6 +1332,7 @@ tests/
   test_fares.py
   test_fleet.py
   test_charge.py
+  test_inspect.py
   test_seats.py
   test_disruption.py
   test_gtfs.py
@@ -1276,6 +1390,15 @@ requirements.txt
 精确的：后续可行性只取决于当前电量，而标签比较（电费升序、再按充电量序列字典序）
 具有前缀单调性，被占优的前缀不可能导出更优的完整方案。班次 ≤ 12、电量级别 ≤ 61、
 每状态充电选择 ≤ 61，计算量有界。
+
+`/v1/fleet/inspect` 沿班次链做**按累计里程级别的动态规划**：`dp[m]` 记录「处理完前
+若干班、当前累计里程为 `m`」的最优标签（检修次数，总费用，接续索引序列）。首班只能
+依靠初始里程跑完；在每个接续处，车辆或不检修（里程加上下一班公里数且不得超限），
+或在该站车间检修（工时须完整落入「停站时长 ∩ 开放区间」：两端取
+`min(后班发车, close) − max(前班到达, open)`，不短于工时即合法），里程归零后再跑下一班。
+每个里程级别只保留最优标签是精确的：后续可行性只取决于当前里程，而标签比较
+（次数升序、费用升序、再按索引序列字典序）具有前缀单调性，被占优的前缀不可能导出
+更优的完整方案。班次 ≤ 40、里程级别 ≤ 301、每状态至多 2 种选择，计算量有界。
 
 `/v1/seats/allocate` 把所有班次的相邻停站区间压平成一组容量约束（每区间容量即该班
 `capacity`），每笔预订占用其各段覆盖的区间。由于预订 ≤ 18 笔，对按 ID 升序排列的预订做
